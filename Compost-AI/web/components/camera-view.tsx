@@ -7,14 +7,9 @@ import { meanAbsDiff, objectPresent } from "@/lib/background-diff.mjs";
 
 type Facing = "environment" | "user";
 
-// Fraction of the shorter screen/video dimension used as the scan square.
-// 0.65 = the square covers 65% of the shorter side, centered.
-const SCAN_FRACTION = 0.65;
-
-// Background subtraction: downsample the scan square to GRID×GRID grayscale and
+// Background subtraction: downsample the full frame to GRID×GRID grayscale and
 // compare against a baseline of the empty tray. A capture only classifies when
-// the frame differs from the baseline by at least PRESENCE_THRESHOLD — this
-// stops the model from classifying the bare cardboard tray on a false trigger.
+// the frame differs from the baseline by at least PRESENCE_THRESHOLD.
 const GRID = 48;
 const PRESENCE_THRESHOLD = 0.05; // ≥5% mean grayscale change == new object
 const REFRESH_MAX_DIFF = 0.04;   // refresh baseline only when tray looks unchanged
@@ -33,7 +28,7 @@ interface CameraViewProps {
   autoCapture?: boolean;
   /** Called immediately after autoCapture fires so the parent can clear the flag. */
   onAutoCaptureConsumed?: () => void;
-  /** Called when a trigger fired but the scan square matches the empty tray. */
+  /** Called when a trigger fired but the frame matches the empty tray baseline. */
   onNoObject?: () => void;
 }
 
@@ -67,8 +62,7 @@ export function CameraView({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoCapture, ready]);
 
-  // Downsample the current scan square to a GRID×GRID grayscale buffer for
-  // background comparison. Uses the same crop region as capture().
+  // Downsample the entire frame to a GRID×GRID grayscale buffer for background comparison.
   const sampleGray = React.useCallback((): Uint8ClampedArray | null => {
     const video = videoRef.current;
     if (!video || !ready) return null;
@@ -76,16 +70,12 @@ export function CameraView({
     const h = video.videoHeight;
     if (!w || !h) return null;
 
-    const side = Math.round(Math.min(w, h) * SCAN_FRACTION);
-    const sx = (w - side) / 2;
-    const sy = (h - side) / 2;
-
     const c = document.createElement("canvas");
     c.width = GRID;
     c.height = GRID;
     const ctx = c.getContext("2d", { willReadFrequently: true });
     if (!ctx) return null;
-    ctx.drawImage(video, sx, sy, side, side, 0, 0, GRID, GRID);
+    ctx.drawImage(video, 0, 0, w, h, 0, 0, GRID, GRID);
     const { data } = ctx.getImageData(0, 0, GRID, GRID);
 
     const gray = new Uint8ClampedArray(GRID * GRID);
@@ -96,9 +86,7 @@ export function CameraView({
   }, [ready]);
 
   // Maintain the empty-tray baseline. Sample once on ready, then periodically —
-  // but only overwrite the baseline when the frame still looks like the baseline
-  // (diff < REFRESH_MAX_DIFF). That tracks slow lighting drift while preserving
-  // the empty baseline the moment an object appears.
+  // but only overwrite when the frame still looks like the baseline (diff < REFRESH_MAX_DIFF).
   React.useEffect(() => {
     if (!ready) return;
     const maintain = () => {
@@ -170,7 +158,7 @@ export function CameraView({
     const h = video.videoHeight;
     if (!w || !h) return;
 
-    // Background-subtraction gate: only classify when the scan square differs
+    // Background-subtraction gate: only classify when the full frame differs
     // from the empty-tray baseline. Fail open if no baseline exists yet.
     const gray = sampleGray();
     if (gray && baselineGray && !objectPresent(gray, baselineGray, PRESENCE_THRESHOLD)) {
@@ -178,9 +166,8 @@ export function CameraView({
       return;
     }
 
-    // Crop to the scan square (SCAN_FRACTION of the shorter dimension, centered).
-    const outerSide = Math.min(w, h);
-    const side = Math.round(outerSide * SCAN_FRACTION);
+    // Center square crop — matches the model's 224×224 square input.
+    const side = Math.min(w, h);
     const sx = (w - side) / 2;
     const sy = (h - side) / 2;
 
@@ -203,14 +190,6 @@ export function CameraView({
         className="absolute inset-0 h-full w-full object-cover"
         style={facing === "user" ? { transform: "scaleX(-1)" } : undefined}
       />
-
-      {/* scan square — visual guide; capture crops to this exact region */}
-      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-        <div
-          className="border-2 border-white"
-          style={{ width: `${SCAN_FRACTION * 100}vmin`, height: `${SCAN_FRACTION * 100}vmin` }}
-        />
-      </div>
 
       {/* top bar — flip button only */}
       <div className="absolute right-0 top-0 p-5">
