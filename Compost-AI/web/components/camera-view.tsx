@@ -3,31 +3,21 @@
 import * as React from "react";
 import { SwitchCamera, CameraOff, Loader2 } from "lucide-react";
 
-import { meanAbsDiff } from "@/lib/background-diff.mjs";
-
 type Facing = "environment" | "user";
 
-// Resolution at which we store the baseline and apply the pixel-level mask.
-// 2× the model's 224 input — good quality while keeping arrays manageable.
-const MASK_SIZE = 448;
-
-// Per-pixel grayscale difference below which a pixel is considered "background"
-// (part of the empty tray) and gets replaced with white.
-const PIXEL_DIFF_THRESHOLD = 25; // out of 255
-
-// 48×48 downsample used only for the fast baseline-refresh guard.
-const GRID = 48;
-const REFRESH_MAX_DIFF = 0.04;
-
-// Module-level so baselines survive the camera unmount/remount each scan cycle.
-let baselineGray: Uint8ClampedArray | null = null;   // 48×48 for refresh guard
-let baselineMask: Uint8ClampedArray | null = null;   // MASK_SIZE×MASK_SIZE grayscale
+// Fraction of the shorter screen/video dimension used as the scan square.
+// 0.65 = the square covers 65% of the shorter side, centered.
+const SCAN_FRACTION = 0.65;
 
 interface CameraViewProps {
+  /** Called with a square JPEG data URL when the user taps capture. */
   onCapture: (dataUrl: string) => void;
   busy?: boolean;
+  /** Optional ref populated with { capture } so the Arduino trigger can fire it. */
   triggerRef?: React.MutableRefObject<{ capture: () => void } | null>;
+  /** When true, fires capture as soon as the camera stream is ready. */
   autoCapture?: boolean;
+  /** Called immediately after autoCapture fires so the parent can clear the flag. */
   onAutoCaptureConsumed?: () => void;
 }
 
@@ -44,11 +34,14 @@ export function CameraView({
   const [error, setError] = React.useState<string | null>(null);
   const [ready, setReady] = React.useState(false);
 
+  // Expose capture() to the parent so the Arduino trigger can fire it remotely.
   React.useEffect(() => {
     if (triggerRef) triggerRef.current = { capture };
     return () => { if (triggerRef) triggerRef.current = null; };
   });
 
+  // If we were navigated back from the result screen with autoCapture set,
+  // fire as soon as the video stream is ready.
   React.useEffect(() => {
     if (autoCapture && ready) {
       onAutoCaptureConsumed?.();
@@ -56,52 +49,6 @@ export function CameraView({
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoCapture, ready]);
-
-  // Sample the full frame at a given size and return grayscale pixels.
-  const sampleGrayscale = React.useCallback((size: number): Uint8ClampedArray | null => {
-    const video = videoRef.current;
-    if (!video || !ready) return null;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    if (!w || !h) return null;
-
-    const c = document.createElement("canvas");
-    c.width = size;
-    c.height = size;
-    const ctx = c.getContext("2d", { willReadFrequently: true });
-    if (!ctx) return null;
-    // Center square crop of the full frame, downsampled to `size`.
-    const side = Math.min(w, h);
-    const sx = (w - side) / 2;
-    const sy = (h - side) / 2;
-    ctx.drawImage(video, sx, sy, side, side, 0, 0, size, size);
-    const { data } = ctx.getImageData(0, 0, size, size);
-    const gray = new Uint8ClampedArray(size * size);
-    for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-      gray[p] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
-    }
-    return gray;
-  }, [ready]);
-
-  // Maintain the empty-tray baseline. Update only when the scene is stable
-  // (no object present) so we never accidentally bake the item into the baseline.
-  React.useEffect(() => {
-    if (!ready) return;
-    const maintain = () => {
-      if (busy || autoCapture) return;
-      const g = sampleGrayscale(GRID);
-      if (!g) return;
-      if (!baselineGray || meanAbsDiff(g, baselineGray) < REFRESH_MAX_DIFF) {
-        baselineGray = g;
-        // Also update the high-res mask baseline when the scene is stable.
-        const m = sampleGrayscale(MASK_SIZE);
-        if (m) baselineMask = m;
-      }
-    };
-    maintain();
-    const id = setInterval(maintain, 1500);
-    return () => clearInterval(id);
-  }, [ready, busy, autoCapture, sampleGrayscale]);
 
   const stop = React.useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -123,7 +70,10 @@ export function CameraView({
           video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 1280 } },
           audio: false,
         });
-        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
         streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
@@ -141,7 +91,10 @@ export function CameraView({
     }
 
     start();
-    return () => { cancelled = true; stop(); };
+    return () => {
+      cancelled = true;
+      stop();
+    };
   }, [facing, stop]);
 
   function capture() {
@@ -151,35 +104,19 @@ export function CameraView({
     const h = video.videoHeight;
     if (!w || !h) return;
 
-    // Always capture when the ultrasonic sensor triggers.
-    // Draw the center-square crop to a MASK_SIZE canvas.
-    const side = Math.min(w, h);
+    // Crop to the scan square (SCAN_FRACTION of the shorter dimension, centered)
+    // so only what's inside the on-screen box is sent to the model.
+    const outerSide = Math.min(w, h);
+    const side = Math.round(outerSide * SCAN_FRACTION);
     const sx = (w - side) / 2;
     const sy = (h - side) / 2;
 
     const canvas = document.createElement("canvas");
-    canvas.width = MASK_SIZE;
-    canvas.height = MASK_SIZE;
+    canvas.width = side;
+    canvas.height = side;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.drawImage(video, sx, sy, side, side, 0, 0, MASK_SIZE, MASK_SIZE);
-
-    // Apply background subtraction: pixels that closely match the empty-tray
-    // baseline become white so the model only sees the item.
-    if (baselineMask) {
-      const imageData = ctx.getImageData(0, 0, MASK_SIZE, MASK_SIZE);
-      const { data } = imageData;
-      for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-        const gray = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
-        if (Math.abs(gray - baselineMask[p]) < PIXEL_DIFF_THRESHOLD) {
-          data[i] = 255;     // R → white
-          data[i + 1] = 255; // G → white
-          data[i + 2] = 255; // B → white
-        }
-      }
-      ctx.putImageData(imageData, 0, 0);
-    }
-
+    ctx.drawImage(video, sx, sy, side, side, 0, 0, side, side);
     onCapture(canvas.toDataURL("image/jpeg", 0.9));
   }
 
@@ -193,6 +130,14 @@ export function CameraView({
         className="absolute inset-0 h-full w-full object-cover"
         style={facing === "user" ? { transform: "scaleX(-1)" } : undefined}
       />
+
+      {/* scan square — visual guide; capture crops to this exact region */}
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+        <div
+          className="border-2 border-white"
+          style={{ width: `${SCAN_FRACTION * 100}vmin`, height: `${SCAN_FRACTION * 100}vmin` }}
+        />
+      </div>
 
       {/* top bar — flip button only */}
       <div className="absolute right-0 top-0 p-5">
