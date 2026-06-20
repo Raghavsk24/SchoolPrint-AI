@@ -20,10 +20,14 @@ import serial
 import requests
 
 PORT        = sys.argv[1] if len(sys.argv) > 1 else "COM3"
-NJ_PORT     = sys.argv[2] if len(sys.argv) > 2 else "3000"
+# Second arg: full base URL of the Next.js app (Vercel or localhost).
+# Examples:
+#   python serial_bridge.py COM4 https://compost-ai.vercel.app
+#   python serial_bridge.py COM4 http://localhost:3000
+BASE_URL    = sys.argv[2].rstrip("/") if len(sys.argv) > 2 else "http://localhost:3000"
 BAUD        = 9600
-TRIGGER_URL = f"http://localhost:{NJ_PORT}/api/trigger"
-SERVO_URL   = f"http://localhost:{NJ_PORT}/api/servo-command"
+TRIGGER_URL = f"{BASE_URL}/api/trigger"
+SERVO_URL   = f"{BASE_URL}/api/servo-command"
 
 
 def servo_poller(ser: serial.Serial) -> None:
@@ -51,8 +55,8 @@ def main() -> None:
 
     time.sleep(2)  # Arduino resets on connect; wait for it to be ready
     ser.reset_input_buffer()
-    print(f"[bridge] ready — ITEM_DETECTED → {TRIGGER_URL}")
-    print(f"[bridge]         servo commands ← {SERVO_URL}")
+    print(f"[bridge] ready  ITEM_DETECTED → {TRIGGER_URL}")
+    print(f"[bridge]        servo commands ← {SERVO_URL}")
 
     # Start servo polling on a daemon thread so it exits when the main thread does.
     t = threading.Thread(target=servo_poller, args=(ser,), daemon=True)

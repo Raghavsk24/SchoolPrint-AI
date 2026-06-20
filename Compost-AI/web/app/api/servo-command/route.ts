@@ -1,20 +1,22 @@
 import { NextResponse } from "next/server";
+import { Redis } from "@upstash/redis";
 
 export const dynamic = "force-dynamic";
 
-// In-memory one-shot queue. The web app POSTs "GARBAGE" or "COMPOST" after
-// classification; the Python bridge GETs and consumes it, then writes the
-// command to the Arduino over serial.
-let pending: string | null = null;
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
+
+const KEY = "compost:servo";
 
 export async function POST(req: Request) {
   const { command } = await req.json();
-  pending = command;
+  await redis.set(KEY, command, { ex: 30 });
   return NextResponse.json({ ok: true });
 }
 
 export async function GET() {
-  const cmd = pending;
-  pending = null;
-  return NextResponse.json({ command: cmd });
+  const cmd = await redis.getdel(KEY);
+  return NextResponse.json({ command: cmd ?? null });
 }
